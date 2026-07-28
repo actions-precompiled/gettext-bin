@@ -100,6 +100,7 @@ builds are safe.
 | `GETTEXT_MIRROR` | Base URL for tarballs (default `https://ftp.gnu.org/gnu/gettext`) |
 | `MIN_GETTEXT_VERSION` | Floor for auto-detect / Dispatch Missing (default `0.19`) |
 | `SKIP_GPG` | Set `1` to skip signature verify (not recommended; missing `.sig` is already a soft skip) |
+| `GPG_KEYS` | Space-separated key ids to prefetch (defaults cover Bruno Haible keys across gettext history) |
 
 Smoke tests extract the tarball, run `--version` on core tools, and compile a tiny `.po`.
 

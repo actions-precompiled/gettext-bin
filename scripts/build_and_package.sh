@@ -11,8 +11,10 @@ JOBS="${JOBS:-$(nproc)}"
 KEEP_SYMBOLS="${KEEP_SYMBOLS:-0}"
 # Optional: skip GPG verify (not recommended)
 SKIP_GPG="${SKIP_GPG:-0}"
-# Bruno Haible signing keys (same set the old Dagger pipeline used)
-GPG_KEYS="${GPG_KEYS:-B6301D9E1BBEAC08 F5BE8B267C6A406D 4F494A942E4616C2}"
+# Bruno Haible signing keys across gettext history (long → short key ids).
+# Modern: B6301D9E1BBEAC08 / F5BE8B267C6A406D / 4F494A942E4616C2
+# Older:  D605848ED7E69871 (≈0.19), 2FAB164DA1534B85 (≈0.18), 7E2D65C109718317 (≈0.14)
+GPG_KEYS="${GPG_KEYS:-B6301D9E1BBEAC08 F5BE8B267C6A406D 4F494A942E4616C2 D605848ED7E69871 2FAB164DA1534B85 7E2D65C109718317}"
 
 RAW_VERSION="${GETTEXT_VERSION}"
 if [[ "$RAW_VERSION" =~ ^v ]]; then
@@ -54,17 +56,61 @@ SIG_URL="${GETTEXT_MIRROR}/gettext-${TAG}.tar.gz.sig"
 echo "Downloading ${TARBALL_URL}..."
 curl --fail --silent --show-error --location --retry 3 -o "$TARBALL" "$TARBALL_URL"
 
+gpg_recv() {
+  # shellcheck disable=SC2086
+  local keys="$*"
+  [[ -z "$keys" ]] && return 0
+  gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys ${keys} \
+    || gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys ${keys} \
+    || gpg --batch --keyserver keyserver.ubuntu.com --recv-keys ${keys}
+}
+
 if [[ "$SKIP_GPG" != "1" ]]; then
   echo "Downloading signature (if published)..."
   if curl --fail --silent --show-error --location --retry 3 -o "$SIGFILE" "$SIG_URL"; then
     export GNUPGHOME="${GNUPGHOME:-${WORKDIR}/gnupg}"
     mkdir -p "$GNUPGHOME"
     chmod 700 "$GNUPGHOME"
+    # Prefetch known Bruno Haible keys (best effort — keyservers flake)
     # shellcheck disable=SC2086
-    gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys ${GPG_KEYS} \
-      || gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys ${GPG_KEYS} \
-      || gpg --batch --keyserver keyserver.ubuntu.com --recv-keys ${GPG_KEYS}
-    gpg --batch --verify "$SIGFILE" "$TARBALL"
+    gpg_recv ${GPG_KEYS} || true
+
+    # Issuer key id from the signature packet (works even when key is unknown)
+    ISSUER_KEYS="$(
+      gpg --list-packets "$SIGFILE" 2>/dev/null \
+        | sed -n 's/.*issuer key ID \([0-9A-Fa-f]\+\).*/\1/p' \
+        | sort -u \
+        | tr '\n' ' '
+    )"
+    if [[ -n "${ISSUER_KEYS// }" ]]; then
+      echo "Signature issuer key(s): ${ISSUER_KEYS}"
+      # shellcheck disable=SC2086
+      gpg_recv ${ISSUER_KEYS} || true
+    fi
+
+    set +e
+    VERIFY_OUT="$(gpg --batch --verify "$SIGFILE" "$TARBALL" 2>&1)"
+    VERIFY_RC=$?
+    set -e
+    echo "$VERIFY_OUT"
+    if [[ "$VERIFY_RC" -ne 0 ]]; then
+      # Retry once after pulling any key id mentioned in the verify output
+      EXTRA="$(
+        echo "$VERIFY_OUT" \
+          | sed -n 's/.*using .* key \([0-9A-Fa-f]\+\).*/\1/p' \
+          | sort -u \
+          | tr '\n' ' '
+      )"
+      if [[ -n "${EXTRA// }" ]]; then
+        echo "Retrying after fetching key(s) from verify output: ${EXTRA}"
+        # shellcheck disable=SC2086
+        gpg_recv ${EXTRA} || true
+        gpg --batch --verify "$SIGFILE" "$TARBALL"
+      else
+        echo "GPG verify failed (rc=${VERIFY_RC}) and no key id to fetch" >&2
+        exit "$VERIFY_RC"
+      fi
+    fi
   else
     echo "Warning: no .sig at ${SIG_URL}; continuing without GPG verify" >&2
   fi
