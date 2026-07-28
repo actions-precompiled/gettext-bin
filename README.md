@@ -5,7 +5,7 @@ Linux, published as tarballs you can unpack and use with [mise](https://mise.jdx
 asdf, or a plain `PATH` entry.
 
 Each package includes the gettext tools (`msgfmt`, `xgettext`, `msgmerge`, …)
-built as a static-lean tree with `--enable-relocatable`.
+built as a static-lean tree (wrappers + RPATH for relocatability).
 
 ## Why not Dagger / buildenv?
 
@@ -106,7 +106,7 @@ Smoke tests extract the tarball, run `--version` on core tools, and compile a ti
 
 1. Downloads `gettext-<version>.tar.gz` (+ `.sig`) from the GNU mirror  
 2. Verifies the GPG signature (Bruno Haible keys)  
-3. Configures with `--disable-shared --enable-static --enable-relocatable`  
+3. Configures with `--disable-shared --enable-static`  
 4. Installs into a staging prefix and packages `gettext/`  
 5. Emits `gettext-<version>-linux-amd64.tar.gz` under `target/<target>/`
 
