@@ -1,9 +1,11 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = [
+#   "packaging>=24.0",
+# ]
 # ///
-"""Orchestrate gettext prebuilds. Python 3 stdlib only (puppet for docker/gh)."""
+"""Orchestrate gettext prebuilds (puppet for docker/gh). Version logic uses packaging."""
 
 from __future__ import annotations
 
@@ -17,6 +19,8 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
+
+from packaging.version import InvalidVersion, Version
 
 ROOT = Path(__file__).resolve().parent
 IMAGE_NAME = os.environ.get("IMAGE_NAME", "gettext-buildenv")
@@ -57,6 +61,25 @@ def run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.Completed
 
 def version_bare(version: str) -> str:
     return version[1:] if version.startswith("v") else version
+
+
+def parse_version(version: str) -> Version | None:
+    """Parse a bare or v-prefixed gettext version; None if not a PEP 440 version."""
+    bare = version_bare(version)
+    try:
+        return Version(bare)
+    except InvalidVersion:
+        return None
+
+
+def version_sort_key(version: str) -> Version:
+    """Sort key for gettext versions (invalids sort first as 0)."""
+    return parse_version(version) or Version("0")
+
+
+def sort_versions(versions) -> list[str]:
+    """Ascending order by packaging.version.Version (oldest → newest)."""
+    return sorted((version_bare(v) for v in versions), key=version_sort_key)
 
 
 def find_tarballs(out_root: Path, version: str, target: str) -> list[Path]:
@@ -231,14 +254,26 @@ def github_api_json(path: str) -> object:
 
 
 def list_upstream_versions() -> list[str]:
-    """Parse GNU gettext directory listing for gettext-X.Y.Z.tar.gz names."""
+    """Parse GNU gettext directory listing; return versions oldest → newest."""
     eprint(f"Fetching GNU listing from {GNU_LISTING_URL}...")
     html = curl_text(GNU_LISTING_URL)
-    # Match gettext-0.22.5.tar.gz but not .sig / .diff
+    # Match gettext-0.22.5.tar.gz but not .sig / .diff / .tar.xz
     found = set(re.findall(r"gettext-([0-9][0-9A-Za-z.+_-]*)\.tar\.gz(?![.\w])", html))
-    # Filter out junk like "latest" if any; keep version-looking strings
-    versions = sorted(v for v in found if re.match(r"^\d", v))
-    return versions
+    valid: list[str] = []
+    for raw in found:
+        if parse_version(raw) is None:
+            eprint(f"  skip unparsable version token: {raw!r}")
+            continue
+        valid.append(version_bare(raw))
+    return sort_versions(valid)
+
+
+def latest_upstream_version() -> str:
+    """Newest gettext version on the GNU mirror (packaging.version order)."""
+    versions = list_upstream_versions()
+    if not versions:
+        raise RuntimeError(f"no gettext versions found at {GNU_LISTING_URL}")
+    return versions[-1]
 
 
 def list_released_tags() -> list[str]:
@@ -251,7 +286,9 @@ def list_released_tags() -> list[str]:
             text=True,
         )
         if proc.returncode == 0 and proc.stdout is not None:
-            return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            return sort_versions(
+                line.strip() for line in proc.stdout.splitlines() if line.strip()
+            )
 
     repo = os.environ.get("GITHUB_REPOSITORY")
     if not repo:
@@ -276,22 +313,21 @@ def list_released_tags() -> list[str]:
     except RuntimeError as exc:
         eprint(f"Warning: could not list releases ({exc}); assuming none")
         return []
-    return tags
+    return sort_versions(tags)
 
 
 def versions_to_build(cli_versions: list[str]) -> list[str]:
     if cli_versions:
-        return [version_bare(v) for v in cli_versions]
+        return sort_versions(cli_versions)
 
     upstream = set(list_upstream_versions())
     eprint(f"  upstream: {len(upstream)}")
 
     eprint("Fetching existing releases from this repository...")
-    released = {version_bare(t) for t in list_released_tags()}
+    released = set(list_released_tags())
     eprint(f"  released: {len(released)}")
 
-    missing = sorted(upstream - released)
-    return missing
+    return sort_versions(upstream - released)
 
 
 def host_docker_arch() -> str:
@@ -470,9 +506,39 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Only smoke-test existing tarballs under target/ (no docker build)",
     )
+    parser.add_argument(
+        "--print-latest",
+        action="store_true",
+        help="Print newest upstream gettext version (packaging order) and exit",
+    )
+    parser.add_argument(
+        "--list-upstream",
+        action="store_true",
+        help="Print all upstream versions (oldest→newest), one per line, and exit",
+    )
+    parser.add_argument(
+        "--list-to-build",
+        action="store_true",
+        help=(
+            "Print versions that would be built (CLI list or missing vs releases), "
+            "oldest→newest, one per line, and exit"
+        ),
+    )
     args = parser.parse_args(argv)
     if args.skip_smoke:
         os.environ["SKIP_SMOKE"] = "1"
+
+    if args.print_latest:
+        print(latest_upstream_version())
+        return 0
+    if args.list_upstream:
+        for v in list_upstream_versions():
+            print(v)
+        return 0
+    if args.list_to_build:
+        for v in versions_to_build(args.versions):
+            print(v)
+        return 0
 
     targets = targets_from_env()
     versions = versions_to_build(args.versions)

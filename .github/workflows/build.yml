@@ -47,6 +47,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install mise tools (uv)
+        uses: jdx/mise-action@v2
+
       - name: Resolve version
         id: plan
         env:
@@ -57,54 +60,39 @@ jobs:
           INPUT_RECREATE: ${{ github.event.inputs.recreate }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          python3 <<'PY'
-          import json, os, importlib.machinery, importlib.util
-          from pathlib import Path
-
-          out = Path(os.environ["GITHUB_OUTPUT"])
-          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
-          event = os.environ.get("EVENT_NAME", "")
-          raw = (os.environ.get("INPUT_VERSION") or "").strip()
-          publish_raw = (os.environ.get("INPUT_PUBLISH") or "false").lower()
-          recreate_raw = (os.environ.get("INPUT_RECREATE") or "false").lower()
-          publish = event == "workflow_dispatch" and publish_raw in ("true", "1", "yes")
-          recreate = publish and recreate_raw in ("true", "1", "yes")
-
-          if raw:
-              version = raw.lstrip("v")
-          else:
-              path = Path("create_releases").resolve()
-              loader = importlib.machinery.SourceFileLoader("create_releases", str(path))
-              spec = importlib.util.spec_from_loader(loader.name, loader)
-              assert spec is not None and spec.loader is not None
-              mod = importlib.util.module_from_spec(spec)
-              loader.exec_module(mod)
-              versions = mod.list_upstream_versions()
-              if not versions:
-                  raise SystemExit("no upstream versions found from GNU listing")
-              # Prefer newest: sort by loose version tuple of ints where possible
-              def key(v: str):
-                  parts = []
-                  for p in v.replace("-", ".").split("."):
-                      try:
-                          parts.append(int(p))
-                      except ValueError:
-                          parts.append(0)
-                  return tuple(parts)
-              version = sorted(versions, key=key)[-1]
-
-          print(f"version={version} publish={publish} recreate={recreate} event={event}")
-          with out.open("a", encoding="utf-8") as fh:
-              fh.write(f"version={version}\n")
-              fh.write(f"publish={'true' if publish else 'false'}\n")
-              fh.write(f"recreate={'true' if recreate else 'false'}\n")
-          with summary.open("a", encoding="utf-8") as fh:
-              fh.write("## Build plan\n\n")
-              fh.write(f"- Version: `{version}`\n")
-              fh.write(f"- Publish GitHub Release: **{'yes' if publish else 'no'}**\n")
-              fh.write(f"- Recreate (delete then create): **{'yes' if recreate else 'no'}**\n")
-              fh.write(f"- Trigger: `{event}`\n")
-          PY
+          set -euo pipefail
+          event="${EVENT_NAME}"
+          raw="${INPUT_VERSION:-}"
+          publish_raw="${INPUT_PUBLISH:-false}"
+          recreate_raw="${INPUT_RECREATE:-false}"
+          publish=false
+          recreate=false
+          if [[ "$event" == "workflow_dispatch" ]]; then
+            case "${publish_raw,,}" in true|1|yes) publish=true ;; esac
+            if [[ "$publish" == true ]]; then
+              case "${recreate_raw,,}" in true|1|yes) recreate=true ;; esac
+            fi
+          fi
+          if [[ -n "${raw// }" ]]; then
+            version="${raw#v}"
+          else
+            # packaging.version order lives in create_releases (Python)
+            version="$(./create_releases --print-latest)"
+          fi
+          echo "version=${version} publish=${publish} recreate=${recreate} event=${event}"
+          {
+            echo "version=${version}"
+            echo "publish=${publish}"
+            echo "recreate=${recreate}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Build plan"
+            echo ""
+            echo "- Version: \`${version}\`"
+            echo "- Publish GitHub Release: **${publish}**"
+            echo "- Recreate (delete then create): **${recreate}**"
+            echo "- Trigger: \`${event}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     needs: plan

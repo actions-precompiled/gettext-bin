@@ -5,6 +5,7 @@ name: Dispatch Missing Builds
 # release) so one failure never cancels the others.
 #
 # Does not build itself — only fans out to build.yml.
+# Version selection/sorting is entirely create_releases (Python + packaging).
 
 on:
   workflow_dispatch:
@@ -24,7 +25,7 @@ on:
         type: boolean
         default: false
       max:
-        description: 'Cap how many versions to dispatch (0 = no cap). Use for smoke (e.g. 3).'
+        description: 'Cap how many versions to dispatch (0 = no cap). Newest N when set (e.g. 3).'
         required: false
         type: string
         default: "0"
@@ -45,6 +46,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install mise tools (uv)
+        uses: jdx/mise-action@v2
+
       - name: Plan and dispatch Build runs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -54,77 +58,76 @@ jobs:
           INPUT_RECREATE: ${{ inputs.recreate }}
           INPUT_MAX: ${{ inputs.max }}
         run: |
-          python3 <<'PY'
-          import json, os, subprocess, importlib.machinery, importlib.util, time
-          from pathlib import Path
+          set -euo pipefail
+          publish=false
+          recreate=false
+          case "${INPUT_PUBLISH:-false}" in true|1|yes|True) publish=true ;; esac
+          case "${INPUT_RECREATE:-false}" in true|1|yes|True) recreate=true ;; esac
+          max_n="${INPUT_MAX:-0}"
+          max_n="${max_n// /}"
+          [[ -n "$max_n" ]] || max_n=0
 
-          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
-          raw = (os.environ.get("INPUT_VERSIONS") or "").strip()
-          publish = (os.environ.get("INPUT_PUBLISH") or "false").lower() in (
-              "true", "1", "yes",
+          # packaging-sorted list from create_releases (oldest → newest)
+          mapfile -t versions < <(
+            if [[ -n "${INPUT_VERSIONS// }" ]]; then
+              # shellcheck disable=SC2086
+              ./create_releases --list-to-build ${INPUT_VERSIONS}
+            else
+              ./create_releases --list-to-build
+            fi
           )
-          recreate = (os.environ.get("INPUT_RECREATE") or "false").lower() in (
-              "true", "1", "yes",
-          )
-          try:
-              max_n = int((os.environ.get("INPUT_MAX") or "0").strip() or "0")
-          except ValueError:
-              max_n = 0
 
-          if raw:
-              versions = raw.split()
-          else:
-              path = Path("create_releases").resolve()
-              loader = importlib.machinery.SourceFileLoader("create_releases", str(path))
-              spec = importlib.util.spec_from_loader(loader.name, loader)
-              assert spec is not None and spec.loader is not None
-              mod = importlib.util.module_from_spec(spec)
-              loader.exec_module(mod)
-              versions = mod.versions_to_build([])
+          if [[ "$max_n" =~ ^[0-9]+$ ]] && [[ "$max_n" -gt 0 ]]; then
+            if (( ${#versions[@]} > max_n )); then
+              versions=("${versions[@]: -max_n}")
+            fi
+          fi
 
-          if max_n > 0:
-              # Prefer newest-looking tags last alphabetically is wrong for 3.x vs 5.x;
-              # sort then take from the end (higher versions often sort later for 5.x).
-              versions = versions[-max_n:] if len(versions) > max_n else versions
+          {
+            echo "## Dispatch plan"
+            echo ""
+            echo "- Count: **${#versions[@]}**"
+            echo "- Publish each: **${publish}**"
+            echo "- Recreate each: **${recreate}**"
+            echo "- Max cap: \`${max_n:-none}\`"
+            echo ""
+            if ((${#versions[@]} == 0)); then
+              echo "Nothing to dispatch."
+            else
+              for v in "${versions[@]}"; do
+                echo "- \`${v}\`"
+              done
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
-          lines = [
-              "## Dispatch plan\n",
-              f"- Count: **{len(versions)}**\n",
-              f"- Publish each: **{publish}**\n",
-              f"- Recreate each: **{recreate}**\n",
-              f"- Max cap: `{max_n or 'none'}`\n\n",
-          ]
-          if not versions:
-              lines.append("Nothing to dispatch.\n")
-              summary.write_text("".join(lines), encoding="utf-8")
-              print("No versions to dispatch")
-              raise SystemExit(0)
+          if ((${#versions[@]} == 0)); then
+            echo "No versions to dispatch"
+            exit 0
+          fi
 
-          for v in versions:
-              lines.append(f"- `{v}`\n")
-          summary.write_text("".join(lines), encoding="utf-8")
+          echo "Dispatching ${#versions[@]} Build run(s), publish=${publish}, recreate=${recreate}"
+          failed=()
+          i=0
+          for version in "${versions[@]}"; do
+            cmd=(gh workflow run build.yml
+              --ref "${GITHUB_REF_NAME:-main}"
+              -f "version=${version}"
+              -f "publish=${publish}"
+              -f "recreate=${recreate}"
+            )
+            echo "+ ${cmd[*]}"
+            if ! "${cmd[@]}"; then
+              echo "FAILED to dispatch ${version}"
+              failed+=("$version")
+            fi
+            i=$((i + 1))
+            if (( i < ${#versions[@]} )); then
+              sleep 1.5
+            fi
+          done
 
-          print(f"Dispatching {len(versions)} Build run(s), publish={publish}, recreate={recreate}")
-          failed = []
-          for i, version in enumerate(versions):
-              cmd = [
-                  "gh", "workflow", "run", "build.yml",
-                  "--ref", os.environ.get("GITHUB_REF_NAME") or "main",
-                  "-f", f"version={version}",
-                  "-f", f"publish={'true' if publish else 'false'}",
-                  "-f", f"recreate={'true' if recreate else 'false'}",
-              ]
-              print("+", " ".join(cmd), flush=True)
-              proc = subprocess.run(cmd, check=False)
-              if proc.returncode != 0:
-                  print(f"FAILED to dispatch {version}", flush=True)
-                  failed.append(version)
-              # Small pause so Actions is not slammed with N simultaneous creates
-              if i + 1 < len(versions):
-                  time.sleep(1.5)
-
-          if failed:
-              print("Dispatch failures:", failed, flush=True)
-              raise SystemExit(1)
-          print("✓ All Build runs dispatched", flush=True)
-          PY
+          if ((${#failed[@]} > 0)); then
+            echo "Dispatch failures: ${failed[*]}"
+            exit 1
+          fi
+          echo "✓ All Build runs dispatched"

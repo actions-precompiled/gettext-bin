@@ -73,14 +73,15 @@ fi
 echo "Extracting..."
 tar -xzf "$TARBALL" -C "$SRC_DIR" --strip-components=1
 
-# --- configure & build (static tools, relocatable install) ---
-# Disable language bindings we do not ship; keep C/C++ tools lean.
+# --- configure & build (static-lean tools) ---
+# Relocatability comes from bin wrappers + RPATH (not --enable-relocatable:
+# that path fails to build on modern glibc for gettext 1.0 / progreloc).
+# Disable language bindings we do not ship.
 cd "$SRC_DIR"
 ./configure \
   --prefix=/usr \
   --disable-shared \
   --enable-static \
-  --enable-relocatable \
   --disable-java \
   --disable-native-java \
   --disable-csharp \
@@ -270,7 +271,7 @@ version=${TAG}
 upstream_version=${TAG}
 build_target=${BUILD_TARGET}
 mirror=${GETTEXT_MIRROR}
-configure=--disable-shared --enable-static --enable-relocatable
+configure=--disable-shared --enable-static
 built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 META
 
