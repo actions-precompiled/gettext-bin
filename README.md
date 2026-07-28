@@ -98,7 +98,8 @@ builds are safe.
 | `SKIP_IMAGE_BUILD` | Reuse an already-built `gettext-buildenv:local` |
 | `IMAGE_NAME` / `IMAGE_TAG` | Override image name |
 | `GETTEXT_MIRROR` | Base URL for tarballs (default `https://ftp.gnu.org/gnu/gettext`) |
-| `SKIP_GPG` | Set `1` to skip signature verify (not recommended) |
+| `MIN_GETTEXT_VERSION` | Floor for auto-detect / Dispatch Missing (default `0.19`) |
+| `SKIP_GPG` | Set `1` to skip signature verify (not recommended; missing `.sig` is already a soft skip) |
 
 Smoke tests extract the tarball, run `--version` on core tools, and compile a tiny `.po`.
 
@@ -143,13 +144,18 @@ Orchestration is `create_releases` (uv script, stdlib + `curl`/`docker`/`gh`).
 
 ## Versioning
 
-Release tags track **GNU** gettext versions (`0.26`, `0.25.1`, …). The tarball
+Release tags track **GNU** gettext versions (`0.26`, `0.25.1`, `1.0`, …). The tarball
 name uses the bare version (`gettext-0.26-linux-amd64.tar.gz`).
+
+Auto-detect (Dispatch Missing with empty version list) only considers versions
+**≥ `MIN_GETTEXT_VERSION`** (default **0.19**). Older GNU tarballs are listed on
+ftp.gnu.org but do not build reliably here; pass them explicitly if you really
+want to try.
 
 ## Notes / limitations
 
 - glibc is from Ubuntu 24.04 — older distros may not run the binary.
-- Java/C#/D/Modula-2/Emacs bindings are disabled in this packaging.
+- Java/C#/D/Modula-2/Emacs bindings are disabled when configure accepts those flags.
 - Windows packaging is out of scope for this turn.
 
 ## License

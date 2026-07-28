@@ -55,19 +55,19 @@ echo "Downloading ${TARBALL_URL}..."
 curl --fail --silent --show-error --location --retry 3 -o "$TARBALL" "$TARBALL_URL"
 
 if [[ "$SKIP_GPG" != "1" ]]; then
-  echo "Downloading signature and verifying..."
-  curl --fail --silent --show-error --location --retry 3 -o "$SIGFILE" "$SIG_URL" || {
-    echo "Signature file missing; set SKIP_GPG=1 to proceed without verify" >&2
-    exit 1
-  }
-  export GNUPGHOME="${GNUPGHOME:-${WORKDIR}/gnupg}"
-  mkdir -p "$GNUPGHOME"
-  chmod 700 "$GNUPGHOME"
-  # shellcheck disable=SC2086
-  gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys ${GPG_KEYS} \
-    || gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys ${GPG_KEYS} \
-    || gpg --batch --keyserver keyserver.ubuntu.com --recv-keys ${GPG_KEYS}
-  gpg --batch --verify "$SIGFILE" "$TARBALL"
+  echo "Downloading signature (if published)..."
+  if curl --fail --silent --show-error --location --retry 3 -o "$SIGFILE" "$SIG_URL"; then
+    export GNUPGHOME="${GNUPGHOME:-${WORKDIR}/gnupg}"
+    mkdir -p "$GNUPGHOME"
+    chmod 700 "$GNUPGHOME"
+    # shellcheck disable=SC2086
+    gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys ${GPG_KEYS} \
+      || gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys ${GPG_KEYS} \
+      || gpg --batch --keyserver keyserver.ubuntu.com --recv-keys ${GPG_KEYS}
+    gpg --batch --verify "$SIGFILE" "$TARBALL"
+  else
+    echo "Warning: no .sig at ${SIG_URL}; continuing without GPG verify" >&2
+  fi
 fi
 
 echo "Extracting..."
@@ -76,10 +76,11 @@ tar -xzf "$TARBALL" -C "$SRC_DIR" --strip-components=1
 # --- configure & build (static-lean tools) ---
 # Relocatability comes from bin wrappers + RPATH (not --enable-relocatable:
 # that path fails to build on modern glibc for gettext 1.0 / progreloc).
-# Disable language bindings we do not ship.
+# --disable-option-checking: older gettext lacks some of these flags.
 cd "$SRC_DIR"
 ./configure \
   --prefix=/usr \
+  --disable-option-checking \
   --disable-shared \
   --enable-static \
   --disable-java \

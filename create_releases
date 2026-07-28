@@ -29,6 +29,10 @@ IMAGE_TAG = os.environ.get("IMAGE_TAG", "local")
 GNU_LISTING_URL = os.environ.get(
     "GNU_LISTING_URL", "https://ftp.gnu.org/gnu/gettext/"
 )
+# Floor for auto-detect (Dispatch Missing / bare ./create_releases).
+# Ancient tarballs (0.10–0.18) lack modern configure options and often .sig files;
+# they will not build cleanly on Ubuntu 24.04. Explicit CLI versions bypass this.
+MIN_GETTEXT_VERSION = os.environ.get("MIN_GETTEXT_VERSION", "0.19")
 DEFAULT_TARGETS = ("linux-amd64", "linux-aarch64")
 
 
@@ -80,6 +84,31 @@ def version_sort_key(version: str) -> Version:
 def sort_versions(versions) -> list[str]:
     """Ascending order by packaging.version.Version (oldest → newest)."""
     return sorted((version_bare(v) for v in versions), key=version_sort_key)
+
+
+def min_supported_version() -> Version:
+    parsed = parse_version(MIN_GETTEXT_VERSION)
+    if parsed is None:
+        raise RuntimeError(
+            f"MIN_GETTEXT_VERSION={MIN_GETTEXT_VERSION!r} is not a valid version"
+        )
+    return parsed
+
+
+def is_supported_version(version: str, *, enforce_min: bool = True) -> bool:
+    """True if version parses and (optionally) meets MIN_GETTEXT_VERSION."""
+    parsed = parse_version(version)
+    if parsed is None:
+        return False
+    if enforce_min and parsed < min_supported_version():
+        return False
+    return True
+
+
+def filter_supported(versions, *, enforce_min: bool = True) -> list[str]:
+    """Keep parseable versions at/above the support floor, sorted oldest→newest."""
+    kept = [version_bare(v) for v in versions if is_supported_version(v, enforce_min=enforce_min)]
+    return sort_versions(kept)
 
 
 def find_tarballs(out_root: Path, version: str, target: str) -> list[Path]:
@@ -253,34 +282,60 @@ def github_api_json(path: str) -> object:
     return curl_json(url, headers=headers)
 
 
-def list_upstream_versions() -> list[str]:
-    """Parse GNU gettext directory listing; return versions oldest → newest."""
+def list_upstream_versions(*, enforce_min: bool = True) -> list[str]:
+    """Parse GNU gettext directory listing; return versions oldest → newest.
+
+    By default drops versions below MIN_GETTEXT_VERSION (supported build floor).
+    """
     eprint(f"Fetching GNU listing from {GNU_LISTING_URL}...")
     html = curl_text(GNU_LISTING_URL)
     # Match gettext-0.22.5.tar.gz but not .sig / .diff / .tar.xz
     found = set(re.findall(r"gettext-([0-9][0-9A-Za-z.+_-]*)\.tar\.gz(?![.\w])", html))
     valid: list[str] = []
+    skipped_old = 0
     for raw in found:
         if parse_version(raw) is None:
             eprint(f"  skip unparsable version token: {raw!r}")
             continue
-        valid.append(version_bare(raw))
+        bare = version_bare(raw)
+        if enforce_min and not is_supported_version(bare, enforce_min=True):
+            skipped_old += 1
+            continue
+        valid.append(bare)
+    if enforce_min and skipped_old:
+        eprint(
+            f"  skipped {skipped_old} version(s) older than "
+            f"MIN_GETTEXT_VERSION={MIN_GETTEXT_VERSION}"
+        )
     return sort_versions(valid)
 
 
 def latest_upstream_version() -> str:
-    """Newest gettext version on the GNU mirror (packaging.version order)."""
-    versions = list_upstream_versions()
+    """Newest supported gettext version on the GNU mirror (packaging.version order)."""
+    versions = list_upstream_versions(enforce_min=True)
     if not versions:
-        raise RuntimeError(f"no gettext versions found at {GNU_LISTING_URL}")
+        raise RuntimeError(
+            f"no gettext versions >= {MIN_GETTEXT_VERSION} found at {GNU_LISTING_URL}"
+        )
     return versions[-1]
 
 
 def list_released_tags() -> list[str]:
     """Tags already released on *this* repo (via gh if available, else GitHub API)."""
+    # gh defaults to 30 rows — use a high limit so auto-detect is complete.
     if shutil.which("gh"):
         proc = run(
-            ["gh", "release", "list", "--json", "tagName", "--jq", ".[].tagName"],
+            [
+                "gh",
+                "release",
+                "list",
+                "--limit",
+                "1000",
+                "--json",
+                "tagName",
+                "--jq",
+                ".[].tagName",
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -317,14 +372,15 @@ def list_released_tags() -> list[str]:
 
 
 def versions_to_build(cli_versions: list[str]) -> list[str]:
+    # Explicit CLI versions: honor them (even below the auto-detect floor).
     if cli_versions:
         return sort_versions(cli_versions)
 
-    upstream = set(list_upstream_versions())
-    eprint(f"  upstream: {len(upstream)}")
+    upstream = set(list_upstream_versions(enforce_min=True))
+    eprint(f"  upstream (supported): {len(upstream)} (min={MIN_GETTEXT_VERSION})")
 
     eprint("Fetching existing releases from this repository...")
-    released = set(list_released_tags())
+    released = {version_bare(t) for t in list_released_tags()}
     eprint(f"  released: {len(released)}")
 
     return sort_versions(upstream - released)
@@ -389,7 +445,14 @@ def build_for_target(version: str, target: str, out_root: Path) -> Path:
         "-e",
         "LC_ALL=C.UTF-8",
     ]
-    for key in ("GETTEXT_MIRROR", "JOBS", "KEEP_SYMBOLS", "SKIP_GPG", "GPG_KEYS"):
+    for key in (
+        "GETTEXT_MIRROR",
+        "JOBS",
+        "KEEP_SYMBOLS",
+        "SKIP_GPG",
+        "GPG_KEYS",
+        "MIN_GETTEXT_VERSION",
+    ):
         if key in os.environ and os.environ[key] != "":
             cmd.extend(["-e", f"{key}={os.environ[key]}"])
     cmd.append(f"{IMAGE_NAME}:{IMAGE_TAG}")
