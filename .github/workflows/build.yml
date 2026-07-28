@@ -1,0 +1,271 @@
+name: Build
+
+# One version per run. Arch matrix inside; optional GitHub Release at the end.
+#
+# - push / PR: build latest upstream version (artifacts only)
+# - workflow_dispatch: build the given version; optional publish
+#
+# Fan-out many versions via dispatch-missing.yml (each version = separate run).
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream version to build (e.g. 0.26)'
+        required: true
+        type: string
+      publish:
+        description: 'Create GitHub Release and upload tarballs for this version'
+        required: false
+        type: boolean
+        default: false
+      recreate:
+        description: 'If publish: delete existing release for this tag first, then create fresh (fix broken releases)'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: gettext-build-${{ github.event.inputs.version || github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+      recreate: ${{ steps.plan.outputs.recreate }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_PUBLISH: ${{ github.event.inputs.publish }}
+          INPUT_RECREATE: ${{ github.event.inputs.recreate }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 <<'PY'
+          import json, os, importlib.machinery, importlib.util
+          from pathlib import Path
+
+          out = Path(os.environ["GITHUB_OUTPUT"])
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          event = os.environ.get("EVENT_NAME", "")
+          raw = (os.environ.get("INPUT_VERSION") or "").strip()
+          publish_raw = (os.environ.get("INPUT_PUBLISH") or "false").lower()
+          recreate_raw = (os.environ.get("INPUT_RECREATE") or "false").lower()
+          publish = event == "workflow_dispatch" and publish_raw in ("true", "1", "yes")
+          recreate = publish and recreate_raw in ("true", "1", "yes")
+
+          if raw:
+              version = raw.lstrip("v")
+          else:
+              path = Path("create_releases").resolve()
+              loader = importlib.machinery.SourceFileLoader("create_releases", str(path))
+              spec = importlib.util.spec_from_loader(loader.name, loader)
+              assert spec is not None and spec.loader is not None
+              mod = importlib.util.module_from_spec(spec)
+              loader.exec_module(mod)
+              versions = mod.list_upstream_versions()
+              if not versions:
+                  raise SystemExit("no upstream versions found from GNU listing")
+              # Prefer newest: sort by loose version tuple of ints where possible
+              def key(v: str):
+                  parts = []
+                  for p in v.replace("-", ".").split("."):
+                      try:
+                          parts.append(int(p))
+                      except ValueError:
+                          parts.append(0)
+                  return tuple(parts)
+              version = sorted(versions, key=key)[-1]
+
+          print(f"version={version} publish={publish} recreate={recreate} event={event}")
+          with out.open("a", encoding="utf-8") as fh:
+              fh.write(f"version={version}\n")
+              fh.write(f"publish={'true' if publish else 'false'}\n")
+              fh.write(f"recreate={'true' if recreate else 'false'}\n")
+          with summary.open("a", encoding="utf-8") as fh:
+              fh.write("## Build plan\n\n")
+              fh.write(f"- Version: `{version}`\n")
+              fh.write(f"- Publish GitHub Release: **{'yes' if publish else 'no'}**\n")
+              fh.write(f"- Recreate (delete then create): **{'yes' if recreate else 'no'}**\n")
+              fh.write(f"- Trigger: `{event}`\n")
+          PY
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-latest
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build image (native arch)
+        run: |
+          case "$(uname -m)" in
+            x86_64|amd64) ARCH=amd64 ;;
+            aarch64|arm64) ARCH=arm64 ;;
+            *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          docker build --build-arg "TARGETARCH=${ARCH}" -t gettext-buildenv:local .
+
+      - name: Install mise tools (uv)
+        uses: jdx/mise-action@v2
+
+      - name: Build tarball (upload first, smoke after)
+        env:
+          SKIP_IMAGE_BUILD: "1"
+          IMAGE_NAME: gettext-buildenv
+          IMAGE_TAG: local
+          TARGETS: ${{ matrix.target }}
+        run: ./create_releases --skip-smoke "${{ needs.plan.outputs.version }}"
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        if: success() || failure()
+        with:
+          name: gettext-${{ needs.plan.outputs.version }}-${{ matrix.target }}
+          path: target/${{ matrix.target }}/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Smoke test package
+        if: success()
+        env:
+          TARGETS: ${{ matrix.target }}
+        run: ./create_releases --smoke-only "${{ needs.plan.outputs.version }}"
+
+      - name: List artifacts
+        if: always()
+        run: find target -type f -exec ls -lh {} \; || true
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: gettext-${{ needs.plan.outputs.version }}-*
+          merge-multiple: false
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          RECREATE: ${{ needs.plan.outputs.recreate }}
+        run: |
+          python3 <<'PY'
+          import os, subprocess, sys
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          recreate = (os.environ.get("RECREATE") or "").lower() in ("true", "1", "yes")
+          bare = version[1:] if version.startswith("v") else version
+          root = Path("artifacts")
+          tarballs = sorted(root.rglob("*.tar.gz"))
+          matched = [
+              p for p in tarballs
+              if bare in p.name or version in p.name
+          ]
+          if not matched:
+              print(f"No tarballs for {version} under {root}", file=sys.stderr)
+              for p in root.rglob("*"):
+                  print(" ", p, file=sys.stderr)
+              sys.exit(1)
+
+          names = {p.name for p in matched}
+          need = {
+              f"gettext-{bare}-linux-amd64.tar.gz",
+              f"gettext-{bare}-linux-aarch64.tar.gz",
+          }
+          missing = sorted(need - names)
+          if missing:
+              print(f"Incomplete set for {version}; refusing release. Missing: {missing}", file=sys.stderr)
+              print("Have:", sorted(names), file=sys.stderr)
+              sys.exit(1)
+
+          notes = f"""Prebuilt GNU gettext {version} (relocatable tree, static-lean tools).
+
+          Install: extract the tarball and put `bin/` on your PATH.
+
+          Assets:
+          {chr(10).join(f'- `{p.name}`' for p in sorted(matched))}
+
+          Upstream: https://www.gnu.org/software/gettext/
+          """
+
+          if recreate:
+              print(f"recreate=true — deleting existing release {version} if any", flush=True)
+              subprocess.run(
+                  ["gh", "release", "delete", version, "--yes", "--cleanup-tag"],
+                  check=False,
+              )
+
+          create = subprocess.run(
+              [
+                  "gh", "release", "create", version,
+                  "--title", f"gettext {version}",
+                  "--notes", notes,
+                  "--latest=false",
+              ],
+              check=False,
+          )
+          if create.returncode != 0:
+              if recreate:
+                  print(f"release create failed for {version} after delete", file=sys.stderr)
+                  sys.exit(create.returncode or 1)
+              print(f"release {version} may already exist; uploading assets with --clobber", flush=True)
+
+          for tarball in sorted(matched):
+              print("+", "gh release upload", version, "--clobber", str(tarball), flush=True)
+              subprocess.run(
+                  ["gh", "release", "upload", version, "--clobber", str(tarball)],
+                  check=True,
+              )
+          print(f"✓ Released {version} (recreate={recreate})", flush=True)
+          PY
+
+      - name: Summary
+        if: always()
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          {
+            echo "## Publish"
+            echo ""
+            echo "Version: \`$VERSION\`"
+            echo ""
+            echo "Artifacts:"
+            find artifacts -type f -name '*.tar.gz' -exec ls -lh {} \; || true
+          } >> "$GITHUB_STEP_SUMMARY"

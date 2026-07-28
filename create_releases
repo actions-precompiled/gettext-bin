@@ -1,34 +1,521 @@
-#!/usr/bin/env bash
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""Orchestrate gettext prebuilds. Python 3 stdlib only (puppet for docker/gh)."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+IMAGE_NAME = os.environ.get("IMAGE_NAME", "gettext-buildenv")
+IMAGE_TAG = os.environ.get("IMAGE_TAG", "local")
+# GNU gettext lives on ftp.gnu.org, not GitHub. Override listing URL if needed.
+GNU_LISTING_URL = os.environ.get(
+    "GNU_LISTING_URL", "https://ftp.gnu.org/gnu/gettext/"
+)
+DEFAULT_TARGETS = ("linux-amd64", "linux-aarch64")
 
 
-function build_release {
-  VERSION="$1"; shift
-  dagger call build-version --version "$VERSION" export --path target
-  echo "" | gh release create "$VERSION" --target empty || true # if it exists no problem, I D E M P O T E N C Y
-  gh release upload "$VERSION" --clobber ./target/"$VERSION"/*
-}
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
 
-# shellcheck disable=SC2206
-versions_to_build=($*)
 
-if [ "${#versions_to_build[@]}" -eq 0 ]; then
-  dagger call version-list export --path upstream_versions.txt
-  gh release list --json tagName | jq '.[].tagName' -r > released_versions.txt
+def env_flag(name: str) -> bool:
+    return name in os.environ and os.environ[name] not in ("", "0", "false", "False")
 
-  # shellcheck disable=SC2207
-  versions_to_build=($(diff -w upstream_versions.txt released_versions.txt | grep -e '^< ' | sed 's;^< ;;'))
-fi
 
-# shellcheck disable=SC2145
-echo "Versions to be build: "
-for version in "${versions_to_build[@]}"; do
-  printf "\tVersion: %s\n" "$version"
-done
+def targets_from_env() -> list[str]:
+    raw = os.environ.get("TARGETS", "").strip()
+    if not raw:
+        machine = os.uname().machine
+        if machine in ("aarch64", "arm64"):
+            return ["linux-aarch64"]
+        return ["linux-amd64"]
+    return raw.split()
 
-if [[ -v DRY_RUN ]]; then
-  exit 0
-fi
 
-for version in "${versions_to_build[@]}"; do
-  build_release "$version"
-done
+def build_output_dir() -> Path:
+    return Path(os.environ.get("BUILD_OUTPUT_DIR", ROOT / "target")).resolve()
+
+
+def run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.CompletedProcess:
+    eprint("+", " ".join(cmd))
+    return subprocess.run(cmd, check=check, **kwargs)
+
+
+def version_bare(version: str) -> str:
+    return version[1:] if version.startswith("v") else version
+
+
+def find_tarballs(out_root: Path, version: str, target: str) -> list[Path]:
+    bare = version_bare(version)
+    d = out_root / target
+    if not d.is_dir():
+        return []
+    matches = sorted(d.glob(f"gettext-{bare}-{target}.tar.gz"))
+    if matches:
+        return matches
+    return sorted(
+        p
+        for p in d.glob("*.tar.gz")
+        if bare in p.name or version in p.name
+    )
+
+
+def smoke_test_tarball(tarball: Path) -> None:
+    """Extract the package and verify core tools run (stdlib only)."""
+    eprint(f"\nSmoke test: {tarball.name}")
+    if not tarball.is_file():
+        raise FileNotFoundError(f"tarball missing: {tarball}")
+
+    with tempfile.TemporaryDirectory(prefix="gettext-smoke-") as tmp:
+        tmp_path = Path(tmp)
+        with tarfile.open(tarball, "r:gz") as tf:
+            try:
+                tf.extractall(tmp_path, filter="data")
+            except TypeError:
+                tf.extractall(tmp_path)
+
+        roots = [p for p in tmp_path.iterdir() if p.is_dir()]
+        if len(roots) != 1:
+            raise RuntimeError(
+                f"expected one top-level dir in tarball, got: {[p.name for p in roots]}"
+            )
+        prefix = roots[0]
+        bin_dir = prefix / "bin"
+        buildinfo = prefix / "BUILDINFO.txt"
+
+        required_names = ("msgfmt", "gettext", "xgettext")
+        missing = [n for n in required_names if not (bin_dir / n).exists()]
+        if missing:
+            raise RuntimeError(f"package missing bin tools: {missing}")
+        if not buildinfo.is_file():
+            raise RuntimeError("package missing BUILDINFO.txt")
+
+        for name in required_names:
+            path = bin_dir / name
+            if not os.access(path, os.X_OK):
+                raise RuntimeError(f"not executable: {path}")
+
+        eprint("--- BUILDINFO ---")
+        eprint(buildinfo.read_text(encoding="utf-8", errors="replace").rstrip())
+
+        def is_loader_error(text: str) -> bool:
+            low = text.lower()
+            return any(
+                s in low
+                for s in (
+                    "error while loading shared libraries",
+                    "cannot open shared object",
+                    "cannot open shared object file",
+                )
+            )
+
+        for tool, args in (
+            ("msgfmt", ["--version"]),
+            ("gettext", ["--version"]),
+            ("xgettext", ["--version"]),
+        ):
+            cmd = [str(bin_dir / tool), *args]
+            eprint("+", " ".join(cmd))
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            out = (proc.stdout or "") + (proc.stderr or "")
+            for line in out.splitlines()[:20]:
+                eprint(" ", line)
+
+            if is_loader_error(out):
+                raise RuntimeError(f"smoke failed for {tool} {args}: dynamic linker error")
+            if not out.strip():
+                raise RuntimeError(f"smoke failed for {tool} {args}: empty output")
+            if proc.returncode != 0 and "gettext" not in out.lower() and "msgfmt" not in out.lower():
+                raise RuntimeError(
+                    f"smoke failed for {tool} {args} (exit {proc.returncode})"
+                )
+
+        # Functional: compile a tiny po → mo
+        po = tmp_path / "test.po"
+        mo = tmp_path / "test.mo"
+        po.write_text(
+            'msgid ""\n'
+            'msgstr ""\n'
+            '"Content-Type: text/plain; charset=UTF-8\\n"\n'
+            "\n"
+            'msgid "hello"\n'
+            'msgstr "olá"\n',
+            encoding="utf-8",
+        )
+        cmd = [str(bin_dir / "msgfmt"), "-o", str(mo), str(po)]
+        eprint("+", " ".join(cmd))
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0 or not mo.is_file() or mo.stat().st_size == 0:
+            err = (proc.stdout or "") + (proc.stderr or "")
+            raise RuntimeError(f"msgfmt compile smoke failed: {err}")
+
+        eprint(f"✓ Smoke test passed: {tarball.name}")
+
+
+def smoke_test_version(version: str, targets: list[str], out_root: Path) -> None:
+    if env_flag("SKIP_SMOKE"):
+        eprint("SKIP_SMOKE set — skipping smoke tests")
+        return
+    eprint("\n" + "=" * 40)
+    eprint(f"Smoke testing {version}")
+    eprint("=" * 40)
+    for target in targets:
+        tarballs = find_tarballs(out_root, version, target)
+        if not tarballs:
+            raise FileNotFoundError(
+                f"no tarball for {version} / {target} under {out_root / target}"
+            )
+        for tarball in tarballs:
+            smoke_test_tarball(tarball)
+
+
+def curl_text(url: str, *, headers: list[tuple[str, str]] | None = None) -> str:
+    if not shutil.which("curl"):
+        raise RuntimeError("curl is required for HTTPS fetches")
+
+    cmd = [
+        "curl",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--max-time",
+        "60",
+        "-H",
+        "User-Agent: actions-precompiled-gettext",
+    ]
+    for key, value in headers or []:
+        cmd.extend(["-H", f"{key}: {value}"])
+    cmd.append(url)
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"curl failed ({proc.returncode}) for {url}: {err}")
+    return proc.stdout
+
+
+def curl_json(url: str, *, headers: list[tuple[str, str]] | None = None) -> object:
+    return json.loads(curl_text(url, headers=headers))
+
+
+def github_api_json(path: str) -> object:
+    url = f"https://api.github.com{path}"
+    headers: list[tuple[str, str]] = [
+        ("Accept", "application/vnd.github+json"),
+        ("X-GitHub-Api-Version", "2022-11-28"),
+    ]
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers.append(("Authorization", f"Bearer {token}"))
+    return curl_json(url, headers=headers)
+
+
+def list_upstream_versions() -> list[str]:
+    """Parse GNU gettext directory listing for gettext-X.Y.Z.tar.gz names."""
+    eprint(f"Fetching GNU listing from {GNU_LISTING_URL}...")
+    html = curl_text(GNU_LISTING_URL)
+    # Match gettext-0.22.5.tar.gz but not .sig / .diff
+    found = set(re.findall(r"gettext-([0-9][0-9A-Za-z.+_-]*)\.tar\.gz(?![.\w])", html))
+    # Filter out junk like "latest" if any; keep version-looking strings
+    versions = sorted(v for v in found if re.match(r"^\d", v))
+    return versions
+
+
+def list_released_tags() -> list[str]:
+    """Tags already released on *this* repo (via gh if available, else GitHub API)."""
+    if shutil.which("gh"):
+        proc = run(
+            ["gh", "release", "list", "--json", "tagName", "--jq", ".[].tagName"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0 and proc.stdout is not None:
+            return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not repo:
+        eprint("No gh and no GITHUB_REPOSITORY — treating released set as empty")
+        return []
+    tags: list[str] = []
+    page = 1
+    try:
+        while True:
+            data = github_api_json(
+                f"/repos/{repo}/releases?per_page=100&page={page}"
+            )
+            if not isinstance(data, list) or not data:
+                break
+            for item in data:
+                name = item.get("tag_name")
+                if name:
+                    tags.append(name)
+            if len(data) < 100:
+                break
+            page += 1
+    except RuntimeError as exc:
+        eprint(f"Warning: could not list releases ({exc}); assuming none")
+        return []
+    return tags
+
+
+def versions_to_build(cli_versions: list[str]) -> list[str]:
+    if cli_versions:
+        return [version_bare(v) for v in cli_versions]
+
+    upstream = set(list_upstream_versions())
+    eprint(f"  upstream: {len(upstream)}")
+
+    eprint("Fetching existing releases from this repository...")
+    released = {version_bare(t) for t in list_released_tags()}
+    eprint(f"  released: {len(released)}")
+
+    missing = sorted(upstream - released)
+    return missing
+
+
+def host_docker_arch() -> str:
+    machine = os.uname().machine
+    if machine in ("x86_64", "amd64"):
+        return "amd64"
+    if machine in ("aarch64", "arm64"):
+        return "arm64"
+    return machine
+
+
+def ensure_image() -> None:
+    if env_flag("SKIP_IMAGE_BUILD"):
+        eprint(f"SKIP_IMAGE_BUILD set — using existing {IMAGE_NAME}:{IMAGE_TAG}")
+        return
+    arch = host_docker_arch()
+    eprint(f"Building Docker image {IMAGE_NAME}:{IMAGE_TAG} (TARGETARCH={arch})...")
+    run(
+        [
+            "docker",
+            "build",
+            "--build-arg",
+            f"TARGETARCH={arch}",
+            "-t",
+            f"{IMAGE_NAME}:{IMAGE_TAG}",
+            str(ROOT),
+        ]
+    )
+
+
+def build_for_target(version: str, target: str, out_root: Path) -> Path:
+    eprint(f"\nBuilding {version} for {target}...")
+    out_dir = out_root / target
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    script = ROOT / "scripts" / "build_and_package.sh"
+    cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "--user",
+        f"{os.getuid()}:{os.getgid()}",
+        "-v",
+        f"{out_dir}:/out",
+        "-v",
+        f"{script}:/usr/local/bin/build_and_package.sh:ro",
+        "-e",
+        f"GETTEXT_VERSION={version_bare(version)}",
+        "-e",
+        f"BUILD_TARGET={target}",
+        "-e",
+        "OUTPUT_DIR=/out",
+        "-e",
+        "HOME=/tmp",
+        "-e",
+        "XDG_CACHE_HOME=/tmp/.cache",
+        "-e",
+        "LANG=C.UTF-8",
+        "-e",
+        "LC_ALL=C.UTF-8",
+    ]
+    for key in ("GETTEXT_MIRROR", "JOBS", "KEEP_SYMBOLS", "SKIP_GPG", "GPG_KEYS"):
+        if key in os.environ and os.environ[key] != "":
+            cmd.extend(["-e", f"{key}={os.environ[key]}"])
+    cmd.append(f"{IMAGE_NAME}:{IMAGE_TAG}")
+    run(cmd)
+    return out_dir
+
+
+def publish_release(version: str, targets: list[str], out_root: Path) -> None:
+    release_tag = version_bare(version)
+    eprint(f"Creating GitHub release {release_tag}...")
+    notes = f"""Prebuilt GNU gettext {release_tag} (relocatable tree, static-lean tools).
+
+Install: extract the tarball and put `bin/` on your PATH (mise/asdf/manual).
+
+Targets: {", ".join(targets)}
+
+Upstream: https://www.gnu.org/software/gettext/
+"""
+    create = run(
+        [
+            "gh",
+            "release",
+            "create",
+            release_tag,
+            "--title",
+            f"gettext {release_tag}",
+            "--notes",
+            notes,
+            "--latest=false",
+        ],
+        check=False,
+        input=b"",
+    )
+    if create.returncode not in (0,):
+        eprint("release create returned non-zero (may already exist); continuing upload")
+
+    eprint("Uploading artifacts...")
+    for target in targets:
+        tarballs = sorted((out_root / target).glob("*.tar.gz"))
+        for tarball in tarballs:
+            run(
+                [
+                    "gh",
+                    "release",
+                    "upload",
+                    release_tag,
+                    "--clobber",
+                    str(tarball),
+                ]
+            )
+    eprint(f"✓ Released {release_tag}")
+
+
+def build_release(
+    version: str,
+    targets: list[str],
+    out_root: Path,
+    *,
+    publish: bool,
+    do_smoke: bool,
+) -> None:
+    eprint("\n" + "=" * 40)
+    eprint(f"Building gettext version {version}")
+    eprint("=" * 40)
+
+    for target in targets:
+        build_for_target(version, target, out_root)
+
+    eprint(f"\nBuilt artifacts for {version}:")
+    for target in targets:
+        d = out_root / target
+        if d.is_dir():
+            run(["ls", "-lh", str(d)], check=False)
+
+    if do_smoke:
+        smoke_test_version(version, targets, out_root)
+
+    if not publish:
+        eprint("Local build only — pass --publish to create a GitHub release")
+        return
+
+    publish_release(version, targets, out_root)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build precompiled gettext tarballs. "
+            "Local by default; use --publish to upload GitHub releases."
+        )
+    )
+    parser.add_argument(
+        "versions",
+        nargs="*",
+        help="Upstream versions to build (default: GNU releases not yet published here)",
+    )
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help="Create GitHub releases and upload tarballs (also: PUBLISH=1)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List versions/targets and exit (also: DRY_RUN=1)",
+    )
+    parser.add_argument(
+        "--skip-smoke",
+        action="store_true",
+        help="Skip post-build smoke tests (also: SKIP_SMOKE=1)",
+    )
+    parser.add_argument(
+        "--smoke-only",
+        action="store_true",
+        help="Only smoke-test existing tarballs under target/ (no docker build)",
+    )
+    args = parser.parse_args(argv)
+    if args.skip_smoke:
+        os.environ["SKIP_SMOKE"] = "1"
+
+    targets = targets_from_env()
+    versions = versions_to_build(args.versions)
+    out_root = build_output_dir()
+    publish = args.publish or env_flag("PUBLISH")
+    do_smoke = not (args.skip_smoke or env_flag("SKIP_SMOKE"))
+
+    if not versions:
+        eprint("No versions to build.")
+        return 0
+
+    eprint(f"\nVersions to build ({len(versions)}):")
+    for v in versions:
+        eprint(f"  - {v}  [targets: {' '.join(targets)}]")
+    eprint(f"Publish: {'yes' if publish else 'no (local only)'}")
+    eprint(
+        f"Smoke: {'yes' if do_smoke and not args.smoke_only else ('only' if args.smoke_only else 'no')}"
+    )
+
+    if args.dry_run or env_flag("DRY_RUN"):
+        eprint("Dry-run — exiting without building")
+        return 0
+
+    if args.smoke_only:
+        for version in versions:
+            smoke_test_version(version, targets, out_root)
+        eprint("\n✓ Smoke-only finished")
+        return 0
+
+    ensure_image()
+
+    for version in versions:
+        build_release(
+            version,
+            targets,
+            out_root,
+            publish=publish,
+            do_smoke=do_smoke,
+        )
+
+    eprint("\n✓ All requested builds finished")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

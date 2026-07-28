@@ -1,2 +1,4 @@
 [tools]
-dagger = "0.18.19"
+# Host-side helpers only — the actual build runs inside Docker.
+uv = "0.11.33"
+jq = "1.8.2"

@@ -1,3 +1,19 @@
-target
+# Build outputs
+target/
+build/
+out/
+__pycache__/
+*.py[cod]
+
+# Auto-generated version lists
 upstream_versions.txt
 released_versions.txt
+upstream_sorted.txt
+released_sorted.txt
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
