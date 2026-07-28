@@ -1,17 +1,19 @@
 name: Dispatch Missing Builds
 
-# Finds versions not yet released on this repo and dispatches Build once per
-# version. Each Build run is isolated (own matrix, own artifacts, own optional
-# release) so one failure never cancels the others.
+# Fans out one Build run per version. Does not build itself.
 #
-# Does not build itself — only fans out to build.yml.
-# Version selection/sorting is entirely create_releases (Python + packaging).
+# Empty `versions`:
+#   - recreate=false → only tags not yet released here (true "missing")
+#   - recreate=true  → every supported upstream version (≥ MIN_GETTEXT_VERSION)
+#                      so rebuild/re-publish works when nothing is "missing"
+#
+# Version selection/sorting is create_releases (Python + packaging).
 
 on:
   workflow_dispatch:
     inputs:
       versions:
-        description: 'Space-separated versions (empty = auto-detect missing vs this repo releases)'
+        description: 'Space-separated versions (empty = missing only, or all supported if recreate)'
         required: false
         type: string
       publish:
@@ -20,7 +22,7 @@ on:
         type: boolean
         default: false
       recreate:
-        description: 'If publish: delete existing release then create (pass recreate to Build)'
+        description: 'Rebuild path: empty versions → all supported; also delete+recreate release on publish'
         required: false
         type: boolean
         default: false
@@ -67,11 +69,14 @@ jobs:
           max_n="${max_n// /}"
           [[ -n "$max_n" ]] || max_n=0
 
-          # packaging-sorted list from create_releases (oldest → newest)
+          # packaging-sorted list from create_releases (oldest → newest).
+          # recreate + empty versions → all supported (not just missing).
           mapfile -t versions < <(
             if [[ -n "${INPUT_VERSIONS// }" ]]; then
               # shellcheck disable=SC2086
               ./create_releases --list-to-build ${INPUT_VERSIONS}
+            elif [[ "$recreate" == true ]]; then
+              ./create_releases --list-to-build --all
             else
               ./create_releases --list-to-build
             fi

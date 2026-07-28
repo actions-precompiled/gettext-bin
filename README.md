@@ -148,10 +148,16 @@ Orchestration is `create_releases` (uv script, stdlib + `curl`/`docker`/`gh`).
 Release tags track **GNU** gettext versions (`0.26`, `0.25.1`, `1.0`, …). The tarball
 name uses the bare version (`gettext-0.26-linux-amd64.tar.gz`).
 
-Auto-detect (Dispatch Missing with empty version list) only considers versions
-**≥ `MIN_GETTEXT_VERSION`** (default **0.19**). Older GNU tarballs are listed on
-ftp.gnu.org but do not build reliably here; pass them explicitly if you really
-want to try.
+Auto-detect only considers versions **≥ `MIN_GETTEXT_VERSION`** (default **0.19**).
+
+| Dispatch Missing inputs | What gets queued |
+|-------------------------|------------------|
+| `versions` empty, `recreate=false` | Supported upstream **minus** tags already released (may be **0**) |
+| `versions` empty, `recreate=true` | **All** supported upstream versions (rebuild / re-publish) |
+| `versions` set | Exactly those versions |
+| `max=N` | Keep only the **newest** N of the planned list |
+
+Older GNU tarballs (&lt; 0.19) are not auto-queued; pass them explicitly if you want to try.
 
 ## Notes / limitations
 
