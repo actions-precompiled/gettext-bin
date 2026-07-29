@@ -7,16 +7,14 @@ asdf, or a plain `PATH` entry.
 Each package includes the gettext tools (`msgfmt`, `xgettext`, `msgmerge`, …)
 built as a static-lean tree (wrappers + RPATH for relocatability).
 
-## Why not Dagger / buildenv?
-
-This repo used to be a Dagger pipeline. It now matches the rest of
-actions-precompiled: **Docker + `create_releases`**, same shape as
-[tesseract-bin](https://github.com/actions-precompiled/tesseract-bin) and
-[quickshell](https://github.com/actions-precompiled/quickshell).
+## Why not `buildenv`?
 
 The generic [buildenv](https://github.com/actions-precompiled/buildenv) image is
 aimed at small C/C++ CMake cross builds. Here we want a native multi-arch image
-and a full GNU autotools configure of gettext.
+and a full GNU autotools configure of gettext. Orchestration is **Docker +
+`create_releases`**, same shape as
+[tesseract-bin](https://github.com/actions-precompiled/tesseract-bin) and
+[quickshell-bin](https://github.com/actions-precompiled/quickshell-bin).
 
 ## Supported targets
 
