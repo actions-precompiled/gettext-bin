@@ -1,6 +1,6 @@
 # Build environment for relocatable gettext binaries (static-lean tools).
 # Native multi-arch: build this image on amd64 or arm64 runners (no QEMU cross).
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ARG TARGETARCH=
 
